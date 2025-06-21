@@ -49,9 +49,23 @@ RESPONSE_SCHEMA = {
                     "resolutionSuggestion": {
                         "type": "STRING",
                         "description": "Suggestion to resolve the hazard or improve safety for this item. Empty string if not a hazard."
+                    },
+                    # New properties for bounding box coordinates
+                    "coordinates": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "x": {"type": "NUMBER", "description": "X-coordinate of the top-left corner."},
+                            "y": {"type": "NUMBER", "description": "Y-coordinate of the top-left corner."},
+                            "width": {"type": "NUMBER", "description": "Width of the bounding box."},
+                            "height": {"type": "NUMBER", "description": "Height of the bounding box."}
+                        },
+                        "description": "Bounding box coordinates (0-1.0 relative to image size) if the item is a hazard.",
+                        "required": ["x", "y", "width", "height"]
                     }
                 },
                 "required": ["item", "safetyRating", "isHazard", "hazardDescription", "resolutionSuggestion"]
+                # Note: 'coordinates' is not 'required' at the object level because it only applies to hazards.
+                # Gemini will include it conditionally based on the prompt.
             }
         },
         "funIdeas": {
@@ -108,11 +122,15 @@ def analyze_room_from_file(image_file_path):
             image_bytes = f.read()
 
         # Prepare the parts for the Gemini API request
+        # Updated prompt to ask for coordinates of hazardous items
         prompt_text = (
             "Analyze the following room image for safety hazards. "
             "Identify objects, assign a safety rating (High, Medium, Low) to each. "
             "For any identified hazard, provide a detailed description of the hazard "
             "and a practical suggestion for resolution. "
+            "IMPORTANT: For each item identified as a HAZARD, also provide its "
+            "bounding box coordinates (x, y, width, height) as relative values "
+            "between 0.0 and 1.0, where (0,0) is the top-left corner of the image. "
             "Also, provide two 'fun ideas': "
             "1. The safest place in the room. "
             "2. Where to go during an earthquake in this specific room. "
@@ -170,6 +188,10 @@ if __name__ == '__main__':
             if item.get('isHazard'):
                 print(f"  Hazard: {item.get('hazardDescription')}")
                 print(f"  Suggestion: {item.get('resolutionSuggestion')}")
+                # Print coordinates if available for hazards
+                coordinates = item.get('coordinates')
+                if coordinates:
+                    print(f"  Coordinates (x,y,w,h): ({coordinates.get('x', 'N/A'):.2f}, {coordinates.get('y', 'N/A'):.2f}, {coordinates.get('width', 'N/A'):.2f}, {coordinates.get('height', 'N/A'):.2f})")
             print("") # Newline for spacing
 
         print("\n--- Fun Ideas! ---")
