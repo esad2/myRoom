@@ -10,7 +10,7 @@ API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y"  # Replace with your actual 
 # Configure the Gemini Generative Model
 genai.configure(api_key=API_KEY)
 # Use a powerful model capable of handling multiple images and complex instructions
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Define the expected JSON schema for the Gemini response
 RESPONSE_SCHEMA = {

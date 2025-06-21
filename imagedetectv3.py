@@ -12,7 +12,7 @@ API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y" # Your Gemini API Key goes h
 # Configure the Gemini Generative Model
 genai.configure(api_key=API_KEY)
 # Use gemini-2.0-flash as requested, suitable for multimodal input (text and image)
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Load a pre-trained YOLOv8 model
 # 'yolov8n.pt' is the nano version, lightweight and good for general object detection.
