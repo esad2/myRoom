@@ -1,149 +1,180 @@
-from __future__ import annotations
-
-"""Room‑Safety Core – Gemini‑only Pipeline (v2.5)
-===================================================
-Removes YOLO entirely. Uses *only* Gemini 2.5 to detect hazards + bboxes + advice + room rating.
-Verbose DEBUG logs track every step.
-"""
-
-import base64
-import io
-import json
-import logging
-import os
-import sys
-from typing import Any, Dict, List, Tuple
-
 import google.generativeai as genai
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from PIL import Image, ImageDraw, ImageFont
+import base64
+import os
+import json
 
-# ----------------------------
-# ENV & Logging
-# ----------------------------
-API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y"
-if not API_KEY:
-    sys.exit("ERROR: GOOGLE_API_KEY must be set")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-latest")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("safety-core")
-logger.info("Using Gemini model %s", MODEL_NAME)
+# Configure Gemini API key. In a production environment, load this securely (e.g., from environment variables).
+# For Canvas environment, an empty string will let the platform inject the key.
+API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y" # Your Gemini API Key goes here. For Canvas, leave as ""
 
+# Configure the Gemini Generative Model
 genai.configure(api_key=API_KEY)
-_client = genai.Client(api_key=API_KEY)
-_model = _client.models.get(MODEL_NAME)
+# Use gemini-2.0-flash as requested, suitable for multimodal input (text and image)
+model = genai.GenerativeModel('gemini-2.0-flash')
 
-# ----------------------------
-# Pydantic Models
-# ----------------------------
-class Hazard(BaseModel):
-    label: str
-    bbox: List[int] = Field(..., min_items=4, max_items=4)
-    severity: str  # low|medium|high|critical
-    advice: str
+# Define the expected JSON schema for the Gemini response
+# This guides Gemini to return structured data for easier parsing and display
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "overallSafetyRating": {
+            "type": "STRING",
+            "description": "Overall safety rating of the room (e.g., 'Excellent', 'Good', 'Fair', 'Poor')."
+        },
+        "overallSafetyScore": {
+            "type": "NUMBER",
+            "description": "Overall safety score out of 100."
+        },
+        "identifiedItems": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "item": {
+                        "type": "STRING",
+                        "description": "Name of the identified object."
+                    },
+                    "safetyRating": {
+                        "type": "STRING",
+                        "description": "Safety rating of this specific item (e.g., 'High', 'Medium', 'Low')."
+                    },
+                    "isHazard": {
+                        "type": "BOOLEAN",
+                        "description": "True if the item is a safety hazard, false otherwise."
+                    },
+                    "hazardDescription": {
+                        "type": "STRING",
+                        "description": "Description of the hazard if 'isHazard' is true. Empty string otherwise."
+                    },
+                    "resolutionSuggestion": {
+                        "type": "STRING",
+                        "description": "Suggestion to resolve the hazard or improve safety for this item. Empty string if not a hazard."
+                    }
+                },
+                "required": ["item", "safetyRating", "isHazard", "hazardDescription", "resolutionSuggestion"]
+            }
+        },
+        "funIdeas": {
+            "type": "OBJECT",
+            "properties": {
+                "safestPlace": {
+                    "type": "STRING",
+                    "description": "A fun suggestion for the safest place in the room."
+                },
+                "earthquakeSpot": {
+                    "type": "STRING",
+                    "description": "A fun suggestion for where to go during an earthquake."
+                }
+            },
+            "required": ["safestPlace", "earthquakeSpot"]
+        }
+    },
+    "required": ["overallSafetyRating", "overallSafetyScore", "identifiedItems", "funIdeas"]
+}
 
-class AnalysisResponse(BaseModel):
-    rating: str  # A|B|C|D|E
-    hazards: List[Hazard]
-    annotated_image_b64: str
+def get_image_mime_type(file_path):
+    """
+    Determines the MIME type of an image based on its file extension.
+    """
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension == '.jpg' or extension == '.jpeg':
+        return 'image/jpeg'
+    elif extension == '.png':
+        return 'image/png'
+    elif extension == '.gif':
+        return 'image/gif'
+    else:
+        return None
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def _to_abs(b: List[float], w: int, h: int) -> Tuple[int,int,int,int]:
-    # Convert normalized or 1000-scale to pixel coords
-    x1, y1, x2, y2 = map(float, b)
-    maxv = max(x1, y1, x2, y2)
-    if maxv <= 1.0:
-        x1, x2 = x1*w, x2*w
-        y1, y2 = y1*h, y2*h
-        logger.debug("Normalized bbox scaled: %s -> pixels", b)
-    elif maxv <= 1000:
-        x1, x2 = x1*w/1000, x2*w/1000
-        y1, y2 = y1*h/1000, y2*h/1000
-        logger.debug("1000-scale bbox scaled: %s -> pixels", b)
-    coords = [int(max(0,min(x1,w))), int(max(0,min(y1,h))), int(max(0,min(x2,w))), int(max(0,min(y2,h)))]
-    logger.debug("Abs bbox coords: %s", coords)
-    return tuple(coords)
+def analyze_room_from_file(image_file_path):
+    """
+    Analyzes a room image from a local file for safety risks using the Gemini API.
+    Args:
+        image_file_path (str): The path to the image file.
+    Returns:
+        dict: The structured safety analysis result, or None if an error occurs.
+    """
+    if not os.path.exists(image_file_path):
+        print(f"Error: File not found at '{image_file_path}'")
+        return None
 
-# ----------------------------
-# Core Analysis
-# ----------------------------
-def _analyze_with_gemini(image_bytes: bytes) -> AnalysisResponse:
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    w, h = img.size
-    logger.debug("Image size: %dx%d", w, h)
+    mime_type = get_image_mime_type(image_file_path)
+    if not mime_type:
+        print(f"Error: Unsupported image file type for '{image_file_path}'. Only JPG, PNG, GIF are supported.")
+        return None
 
-    prompt = {
-        "text": (
-            "You are a certified safety inspector. Analyze the room image and detect "
-            "all visible hazards. Return only JSON matching schema: {\"rating\":\"A|B|C|D|E\", "
-            "\"hazards\":[{\"label\":str,\"bbox\":[x1,y1,x2,y2],\"severity\":\"low|medium|high|critical\",\"advice\":str}]}"
+    try:
+        with open(image_file_path, 'rb') as f:
+            image_bytes = f.read()
+
+        # Prepare the parts for the Gemini API request
+        prompt_text = (
+            "Analyze the following room image for safety hazards. "
+            "Identify objects, assign a safety rating (High, Medium, Low) to each. "
+            "For any identified hazard, provide a detailed description of the hazard "
+            "and a practical suggestion for resolution. "
+            "Also, provide two 'fun ideas': "
+            "1. The safest place in the room. "
+            "2. Where to go during an earthquake in this specific room. "
+            "Return the analysis in a structured JSON format according to the provided schema."
         )
-    }
-    parts = [
-        {"mime_type": "image/jpeg", "data": image_bytes},
-        prompt
-    ]
-    logger.debug("Sending request to Gemini with prompt and image")
-    response = _model.generate_content(parts=parts, generation_config={"response_mime_type":"application/json"})
-    raw = response.candidates[0].text.strip().strip('`')
-    logger.debug("Raw Gemini output: %s", raw)
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.error("JSON parse error: %s", e)
-        raise
+        image_part = {
+            "mime_type": mime_type,
+            "data": image_bytes
+        }
 
-    hazards_out: List[Hazard] = []
-    for h in data.get("hazards", []):
-        bbox = _to_abs(h.get("bbox", []), w, h)
-        hazards_out.append(Hazard(label=h.get("label",""), severity=h.get("severity",""), advice=h.get("advice",""), bbox=list(bbox)))
-    # Annotate
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
-    for haz in hazards_out:
-        draw.rectangle(haz.bbox, outline="red", width=3)
-        draw.text((haz.bbox[0], max(haz.bbox[1]-12,0)), f"{haz.label} ({haz.severity})", fill="red", font=font)
-    buf = io.BytesIO(); img.save(buf, format="JPEG")
-    encoded = base64.b64encode(buf.getvalue()).decode()
+        contents = [
+            {"role": "user", "parts": [{"text": prompt_text}, image_part]}
+        ]
 
-    return AnalysisResponse(rating=data.get("rating",""), hazards=hazards_out, annotated_image_b64=encoded)
+        print("Analyzing image with Gemini AI... (This may take a moment)")
+        # Call the Gemini API with the defined schema
+        gemini_response = model.generate_content(
+            contents,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=RESPONSE_SCHEMA
+            )
+        )
 
-# ----------------------------
-# FastAPI App
-# ----------------------------
-app = FastAPI(title="Room-Safety Gemini API", version="0.3")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+        # The Gemini response.text will contain the JSON string
+        response_json_string = gemini_response.text
+        # Parse the JSON string into a Python dictionary
+        analysis_result = json.loads(response_json_string)
 
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze(file: UploadFile = File(...)):
-    try:
-        img_bytes = await file.read()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to read file")
-    try:
-        return _analyze_with_gemini(img_bytes)
+        return analysis_result
+
     except Exception as e:
-        logger.error("Analysis error: %s", e)
-        raise HTTPException(status_code=500, detail="Analysis failed")
+        print(f"Error during room analysis: {e}")
+        return None
 
-# ----------------------------
-# CLI Demo
-# ----------------------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--demo", required=True, help="Path to input image")
-    args = parser.parse_args()
-    with open(args.demo, "rb") as f:
-        raw = f.read()
-    result = _analyze_with_gemini(raw)
-    print(json.dumps(result.dict(), indent=2))
-    with open("annotated.jpg","wb") as out:
-        out.write(base64.b64decode(result.annotated_image_b64))
-    logger.info("Annotated image written to annotated.jpg")
+if __name__ == '__main__':
+    print("Welcome to the Room Safety Analyzer (Terminal App)!")
+    print("--------------------------------------------------")
+
+    image_path = input("Enter the path to your room image file (e.g., /path/to/room.jpg): ")
+
+    analysis = analyze_room_from_file(image_path)
+
+    if analysis:
+        print("\n--- Safety Analysis Report ---")
+        print(f"Overall Safety Rating: {analysis.get('overallSafetyRating', 'N/A')} (Score: {analysis.get('overallSafetyScore', 'N/A')}/100)")
+        print("\nIdentified Items:")
+        for item in analysis.get('identifiedItems', []):
+            status = "HAZARD" if item.get('isHazard') else "SAFE"
+            color_code = '\033[91m' if item.get('isHazard') else '\033[92m' # Red for hazard, Green for safe
+            reset_color = '\033[0m'
+
+            print(f"- {color_code}{item.get('item')}{reset_color} (Rating: {item.get('safetyRating')}, Status: {status})")
+            if item.get('isHazard'):
+                print(f"  Hazard: {item.get('hazardDescription')}")
+                print(f"  Suggestion: {item.get('resolutionSuggestion')}")
+            print("") # Newline for spacing
+
+        print("\n--- Fun Ideas! ---")
+        fun_ideas = analysis.get('funIdeas', {})
+        print(f"The safest place in the room is: {fun_ideas.get('safestPlace', 'N/A')}")
+        print(f"If an earthquake happens, quickly go towards: {fun_ideas.get('earthquakeSpot', 'N/A')}")
+    else:
+        print("\nAnalysis could not be completed. Please check the image path and try again.")
