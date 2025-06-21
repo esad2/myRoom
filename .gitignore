@@ -1,0 +1,17 @@
+# Python virtual environment
+venv/
+backend/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables - VERY IMPORTANT for security
+.env
+
+# IDE / Editor folders
+.vscode/
+.idea/
+
+# Generated output folders
+hazards/

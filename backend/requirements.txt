@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+google-generativeai
+ultralytics
+Pillow
+numpy<2.0
+python-dotenv
+opencv-python-headless
+requests
