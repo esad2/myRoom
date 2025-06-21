@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------------------
 # Gemini setup ───────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
-API_KEY = os.getenv("AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y")
+API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise EnvironmentError("Please set GOOGLE_API_KEY in your environment.")
 
@@ -59,7 +59,7 @@ Return **only** valid JSON that matches this exact schema (no markdown):
       "severity": "low" | "medium" | "high",
       "advice": "<one concise sentence>"
     },
-    
+    ... up to 10 items ...
   ]
 }
 If no hazards are found, return {"hazards": []}.
