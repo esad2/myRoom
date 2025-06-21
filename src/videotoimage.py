@@ -4,6 +4,7 @@ import requests
 import os
 import json
 import time
+import shutil # Import shutil for directory operations
 
 # --- Configuration ---
 # IMPORTANT:
@@ -18,7 +19,7 @@ import time
 # 5. Paste it below, replacing the empty string.
 # Example: API_KEY = "YOUR_PASTED_API_KEY_HERE"
 API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y" # <--- PASTE YOUR GEMINI API KEY HERE IF RUNNING LOCALLY!
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
 
 # Define safety hazard categories and their severity scores
 HAZARD_SCORES = {
@@ -27,18 +28,62 @@ HAZARD_SCORES = {
     "high": 5,
 }
 
+# Retry settings for API calls
+MAX_RETRIES = 5
+BACKOFF_FACTOR = 1.0 # Initial delay for exponential backoff (e.g., 1s, 2s, 4s, 8s...)
+
 # --- Helper Functions ---
 
-def get_gemini_json_response(prompt, image_data_base64, schema):
+def make_gemini_request(url, headers, payload, is_json_response=True):
     """
-    Sends a request to the Gemini API with a text prompt, image data, and a JSON schema
-    for structured output.
+    Handles API requests to Gemini with retry logic for Too Many Requests errors.
     """
     if not API_KEY:
         print("\nERROR: API_KEY is missing. Please paste your Gemini API key in the script.")
         print("Refer to the instructions in the 'Configuration' section of the code.")
         return None
 
+    api_url_with_key = f"{url}?key={API_KEY}"
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(api_url_with_key, headers=headers, data=json.dumps(payload))
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+            if is_json_response:
+                return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
+            else:
+                return response.json()['candidates'][0]['content']['parts'][0]['text']
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error communicating with Gemini API (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if response is not None:
+                if response.status_code == 403:
+                    print("This usually means your API key is invalid, or the Gemini API is not enabled for your project.")
+                    print("Please ensure your API key is correct and that the Gemini API is enabled in Google Cloud Console.")
+                    return None # Critical error, no point in retrying
+                elif response.status_code == 429:
+                    wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                    print(f"Rate limit hit (429). Retrying in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    # Other HTTP errors, maybe retry, maybe not depending on specific error type
+                    print(f"Unhandled HTTP error: {response.status_code}. Retrying...")
+                    wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                    time.sleep(wait_time)
+            else:
+                print("No response received. Retrying...")
+                wait_time = BACKOFF_FACTOR * (2 ** attempt)
+                time.sleep(wait_time)
+
+    print(f"Failed to get response from Gemini API after {MAX_RETRIES} attempts.")
+    return None
+
+def get_gemini_json_response(prompt, image_data_base64, schema):
+    """
+    Sends a request to the Gemini API with a text prompt, image data, and a JSON schema
+    for structured output.
+    """
     headers = {
         'Content-Type': 'application/json',
     }
@@ -62,31 +107,13 @@ def get_gemini_json_response(prompt, image_data_base64, schema):
             "responseSchema": schema
         }
     }
-    try:
-        api_url_with_key = f"{GEMINI_API_URL}?key={API_KEY}"
-        response = requests.post(api_url_with_key, headers=headers, data=json.dumps(payload))
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
-    except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Gemini API: {e}")
-        if response and response.status_code == 403:
-            print("This usually means your API key is invalid, or the Gemini API is not enabled for your project.")
-            print("Please ensure your API key is correct and that the Gemini API is enabled in Google Cloud Console.")
-        return None
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        print(f"Error parsing Gemini JSON response: {e}")
-        # print(f"Raw response: {response.text if 'response' in locals() else 'No response object'}") # Uncomment for verbose debugging
-        return None
+    return make_gemini_request(GEMINI_API_URL, headers, payload, is_json_response=True)
+
 
 def get_gemini_text_response(prompt, context_text=""):
     """
     Sends a text-only request to the Gemini API for general text generation.
     """
-    if not API_KEY:
-        print("\nERROR: API_KEY is missing. Please paste your Gemini API key in the script.")
-        print("Refer to the instructions in the 'Configuration' section of the code.")
-        return None
-
     headers = {
         'Content-Type': 'application/json',
     }
@@ -98,21 +125,8 @@ def get_gemini_text_response(prompt, context_text=""):
     payload = {
         "contents": chat_history
     }
-    try:
-        api_url_with_key = f"{GEMINI_API_URL}?key={API_KEY}"
-        response = requests.post(api_url_with_key, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        return response.json()['candidates'][0]['content']['parts'][0]['text']
-    except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Gemini API for text: {e}")
-        if response and response.status_code == 403:
-            print("This usually means your API key is invalid, or the Gemini API is not enabled for your project.")
-            print("Please ensure your API key is correct and that the Gemini API is enabled in Google Cloud Console.")
-        return None
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        print(f"Error parsing Gemini text response: {e}")
-        # print(f"Raw response: {response.text if 'response' in locals() else 'No response object'}") # Uncomment for verbose debugging
-        return None
+    return make_gemini_request(GEMINI_API_URL, headers, payload, is_json_response=False)
+
 
 def get_short_summary_from_gemini(long_text, max_words=5):
     """
@@ -129,6 +143,18 @@ def get_short_summary_from_gemini(long_text, max_words=5):
         return " ".join(summary.strip().split()[:max_words])
     return "Hazard Detected" # Fallback if summary generation fails
 
+def clear_hazards_directory(directory="hazards"):
+    """
+    Removes the specified directory and its contents, then recreates it.
+    This effectively "resets" the hazards folder for a new run.
+    """
+    if os.path.exists(directory):
+        print(f"Clearing existing '{directory}' folder...")
+        shutil.rmtree(directory)
+    os.makedirs(directory, exist_ok=True)
+    print(f"Clean '{directory}' folder created at: {os.path.abspath(directory)}")
+
+
 def analyze_video_frames(video_path, frame_sample_rate=30):
     """
     Analyzes video frames for hazards using the Gemini API.
@@ -138,11 +164,10 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
         print(f"Error: Video file not found at '{video_path}'")
         return {"error": f"Video file not found at '{video_path}'"}
 
-    # Create a directory to save hazard frames
+    # Clear and recreate the hazards directory at the start of analysis
     hazards_output_dir = "hazards"
-    os.makedirs(hazards_output_dir, exist_ok=True)
-    print(f"Hazard frames will be saved to: {os.path.abspath(hazards_output_dir)}")
-
+    clear_hazards_directory(hazards_output_dir)
+    
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video file '{video_path}'")
@@ -203,7 +228,7 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70]) # Compress for faster upload
             image_data_base64 = base64.b64encode(buffer).decode('utf-8')
 
-            # Get Gemini response
+            # Get Gemini response for hazard detection
             gemini_response_data = get_gemini_json_response(gemini_hazard_prompt, image_data_base64, hazard_schema)
 
             if gemini_response_data:
@@ -281,7 +306,8 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                 print(f"  Failed to get or parse Gemini response for Frame {frame_number}.")
             
             # Add a small delay to avoid hitting rate limits too quickly, if applicable
-            time.sleep(0.5)
+            # This is separate from exponential backoff for 429 errors.
+            time.sleep(0.1) 
 
         frame_number += 1
 
