@@ -3,8 +3,7 @@ import os
 import json
 from PIL import Image, ImageDraw
 import torch
-# From ultralytics for YOLO
-from ultralytics import YOLO
+from ultralytics import YOLO # For YOLO
 import numpy as np 
 
 # --- Configuration ---
@@ -17,20 +16,14 @@ model = genai.GenerativeModel('gemini-2.5-flash')
 
 # --- YOLO Model Loading ---
 yolo_model = None
-# COCO_CLASSES will be loaded directly from the YOLO model
 COCO_CLASSES = []
 
 try:
-    # Load a pretrained YOLOv8n model (nano, good balance of speed/accuracy)
-    # You can choose other models like 'yolov8s.pt' (small), 'yolov8m.pt' (medium), 'yolov8l.pt' (large)
-    # depending on your desired trade-off between speed and accuracy.
     yolo_model = YOLO('yolov8n.pt') 
     
-    # Get COCO classes from the loaded YOLO model
     if yolo_model.names:
         COCO_CLASSES = [name for i, name in sorted(yolo_model.names.items())]
     else:
-        # Fallback if names attribute isn't directly available (unlikely with ultralytics)
         print("Warning: Could not get class names from YOLO model. Using generic COCO classes.")
         COCO_CLASSES = [
             '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
@@ -52,7 +45,7 @@ try:
 
 except Exception as e:
     print(f"Error loading YOLO model. Ensure ultralytics is installed and model weights are accessible: {e}")
-    yolo_model = None # Ensure it's None if loading failed
+    yolo_model = None 
 
 # Define the expected JSON schema for the Gemini response (per-image)
 RESPONSE_SCHEMA = {
@@ -119,9 +112,13 @@ RESPONSE_SCHEMA = {
                 }
             },
             "required": ["safestPlace", "earthquakeSpot"]
+        },
+        "funFactAboutRoom": {
+            "type": "STRING",
+            "description": "A creative, interesting, or fun fact about the room based on its contents or style, unrelated to safety."
         }
     },
-    "required": ["overallSafetyRating", "overallSafetyScore", "identifiedItems", "funIdeas"]
+    "required": ["overallSafetyRating", "overallSafetyScore", "identifiedItems", "funIdeas", "funFactAboutRoom"]
 }
 
 def get_image_mime_type(file_path):
@@ -150,12 +147,13 @@ def generate_prompt_for_mode(safety_mode, custom_safety_text=None, detected_obje
         "If the hazard is a specifically detected object from the provided list, use its exact coordinates. "
         "If the hazard is a condition or an object not explicitly detected, please infer and provide the most accurate approximate coordinates possible based on the image context. "
         "Also, provide two 'fun ideas': 1. The safest place in the room. 2. Where to go during an earthquake in this specific room. "
+        "**Additionally, provide one creative, interesting, or fun fact about the room based purely on its visible contents or style, unrelated to safety.** "
         "Return the analysis in a structured JSON format according to the provided schema."
     )
 
     if detected_objects_info:
         detection_prompt_addition = (
-            "I have performed object detection using a specialized model (YOLO) on sections of the image, and here are the detected objects with their precise coordinates and confidence scores in the *original image's coordinate system*:\n"
+            "I have performed object detection using a specialized model (YOLO) on the image, and here are the detected objects with their precise coordinates and confidence scores in the *original image's coordinate system*:\n"
             f"```json\n{detected_objects_info}\n```\n\n"
             "Based on the image and these detected objects, identify *all* specific items or conditions that pose safety risks. "
             "Think broadly like a safety inspector and consider hazards such as: "
@@ -202,7 +200,6 @@ def generate_prompt_for_mode(safety_mode, custom_safety_text=None, detected_obje
         )
         return base_prompt + custom_instructions
     
-    # Default to general if no specific mode or custom text is provided
     return base_prompt + "\n\n**Mode: General Workplace Safety.** Focus on common trip hazards, fire safety, and electrical risks."
 
 def perform_object_detection_yolo(pil_image, confidence_threshold):
@@ -221,24 +218,20 @@ def perform_object_detection_yolo(pil_image, confidence_threshold):
     try:
         original_width, original_height = pil_image.size
 
-        # Perform inference
-        # YOLO expects a list of images, even if it's just one
+        # Perform inference on the full image
         results = yolo_model.predict(source=pil_image, conf=confidence_threshold, verbose=False) 
 
         detected_objects = []
         for r in results:
-            boxes = r.boxes # Boxes object
+            boxes = r.boxes 
             for box in boxes:
-                score = box.conf.item() # Confidence score
-                label = int(box.cls.item()) # Class ID
+                score = box.conf.item() 
+                label = int(box.cls.item()) 
                 
-                # Convert xyxy (top-left x,y, bottom-right x,y) to xywh (top-left x,y, width, height)
-                # and get absolute pixel coordinates
                 x1, y1, x2, y2 = box.xyxy[0].tolist() 
 
                 obj_name = COCO_CLASSES[label]
 
-                # Convert to normalized coordinates (0-1.0)
                 normalized_x = float(x1 / original_width)
                 normalized_y = float(y1 / original_height)
                 normalized_width = float((x2 - x1) / original_width)
@@ -260,15 +253,13 @@ def perform_object_detection_yolo(pil_image, confidence_threshold):
         print(f"Error during YOLO detection: {e}")
         return []
 
+# The split_image_into_grid and consolidate_detections functions are no longer used,
+# but keeping them here for reference if future changes require similar logic.
+# They will not be called in the main analysis flow.
 def split_image_into_grid(image_path, grid_size=(3, 3)):
     """
+    (No longer used in main analysis flow)
     Splits a PIL image into a grid of smaller PIL images.
-    Args:
-        image_path (str): Path to the image file.
-        grid_size (tuple): A tuple (rows, cols) for the grid (e.g., (3,3) for 9 sections).
-    Returns:
-        list: A list of tuples, where each tuple contains (cropped_image, (x_offset, y_offset)).
-              x_offset and y_offset are the top-left pixel coordinates of the crop in the original image.
     """
     try:
         original_img = Image.open(image_path).convert("RGB")
@@ -286,7 +277,6 @@ def split_image_into_grid(image_path, grid_size=(3, 3)):
                 right = left + section_width
                 bottom = top + section_height
 
-                # Ensure the last row/column covers the remaining pixels due to integer division
                 if c == cols - 1:
                     right = img_width
                 if r == rows - 1:
@@ -301,25 +291,15 @@ def split_image_into_grid(image_path, grid_size=(3, 3)):
 
 def consolidate_detections(all_section_detections, original_img_size, grid_size=(3,3), iou_threshold=0.3):
     """
+    (No longer used in main analysis flow)
     Consolidates detections from multiple sections, transforms coordinates to original image space,
     and performs non-maximum suppression (NMS) to remove duplicate detections.
-    
-    Args:
-        all_section_detections (list): A list where each element is a tuple:
-                                       (list_of_detections_for_section, (section_x_offset, section_y_offset)).
-        original_img_size (tuple): (original_width, original_height) of the full image.
-        grid_size (tuple): (rows, cols) of the grid used for splitting.
-        iou_threshold (float): IoU (Intersection over Union) threshold for NMS. 
-                               Detections with IoU > threshold will be considered duplicates.
-    Returns:
-        list: A consolidated list of unique detections in original image coordinates.
     """
     original_width, original_height = original_img_size
     rows, cols = grid_size
     
     transformed_detections = []
     for detections_in_section, (x_offset_px, y_offset_px) in all_section_detections:
-        # Determine actual pixel dimensions of the current section to handle edge cases
         current_section_width_px = (original_width // cols)
         if (x_offset_px + current_section_width_px) < original_width and (x_offset_px + (original_width // cols) * (cols - 1) + (original_width % cols)) == original_width and (x_offset_px == (original_width // cols) * (cols - 1)):
              current_section_width_px += (original_width % cols) 
@@ -332,7 +312,6 @@ def consolidate_detections(all_section_detections, original_img_size, grid_size=
         for det in detections_in_section:
             coords = det['coordinates']
 
-            # Transform coordinates from section's normalized space to original image's normalized space
             new_x = float((coords['x'] * current_section_width_px + x_offset_px) / original_width)
             new_y = float((coords['y'] * current_section_height_px + y_offset_px) / original_height)
             new_width = float(coords['width'] * current_section_width_px / original_width)
@@ -352,7 +331,6 @@ def consolidate_detections(all_section_detections, original_img_size, grid_size=
     if not transformed_detections:
         return []
 
-    # Prepare for NMS
     boxes = []
     scores = []
     labels = [] 
@@ -370,7 +348,6 @@ def consolidate_detections(all_section_detections, original_img_size, grid_size=
     scores = np.array(scores)
     labels = np.array(labels)
 
-    # Sort by confidence score in descending order
     sorted_indices = np.argsort(scores)[::-1]
     
     keep = []
@@ -386,7 +363,6 @@ def consolidate_detections(all_section_detections, original_img_size, grid_size=
         if len(sorted_indices) == 0:
             break
 
-        # Calculate IoU with remaining boxes
         remaining_boxes = boxes[sorted_indices]
 
         area_current = (current_box[2] - current_box[0]) * (current_box[3] - current_box[1])
@@ -419,7 +395,7 @@ def consolidate_detections(all_section_detections, original_img_size, grid_size=
 def analyze_single_room_image(image_file_path, safety_mode='general', custom_safety_text=None):
     """
     Analyzes a single room image file for safety risks using the Gemini API.
-    Now includes splitting the image into sections for more robust detection using YOLO.
+    Now performs YOLO object detection on the full image directly.
 
     Args:
         image_file_path (str): The path to the image file.
@@ -439,25 +415,16 @@ def analyze_single_room_image(image_file_path, safety_mode='general', custom_saf
         return None
 
     original_pil_image = Image.open(image_file_path).convert("RGB")
-    original_width, original_height = original_pil_image.size
+    original_width, original_height = original_pil_image.size # These are still needed for coordinate normalization
 
-    consolidated_detections = []
-    if yolo_model: # Check for yolo_model instead of faster_rcnn_model
-        print(f"Splitting {os.path.basename(image_file_path)} into 9 sections and detecting objects with YOLO...")
-        cropped_images_with_offsets = split_image_into_grid(image_file_path, grid_size=(3, 3))
+    detected_objects_for_gemini = []
+    if yolo_model:
+        print(f"Detecting objects on full image: {os.path.basename(image_file_path)} with YOLO...")
+        # Call YOLO directly on the original image
+        detected_objects_for_gemini = perform_object_detection_yolo(original_pil_image, DEFAULT_YOLO_CONF_THRESHOLD) 
         
-        all_detections_from_sections_raw = []
-        for i, (cropped_img, (x_offset_px, y_offset_px)) in enumerate(cropped_images_with_offsets):
-            print(f"  Detecting in section {i+1}/9 (size: {cropped_img.size[0]}x{cropped_img.size[1]} at offset {x_offset_px},{y_offset_px})...")
-            # Use perform_object_detection_yolo and the default threshold
-            detections_in_section = perform_object_detection_yolo(cropped_img, DEFAULT_YOLO_CONF_THRESHOLD) 
-            all_detections_from_sections_raw.append((detections_in_section, (x_offset_px, y_offset_px)))
-        
-        consolidated_detections = consolidate_detections(all_detections_from_sections_raw, 
-                                                         (original_width, original_height), 
-                                                         iou_threshold=0.3) 
-        if not consolidated_detections:
-            print("No objects detected in any section after consolidation.")
+        if not detected_objects_for_gemini:
+            print("No objects detected on the full image.")
     else:
         print("YOLO model not available. Proceeding with Gemini analysis without prior object detections.")
 
@@ -465,9 +432,8 @@ def analyze_single_room_image(image_file_path, safety_mode='general', custom_saf
         with open(image_file_path, 'rb') as f:
             image_bytes = f.read()
 
-        objects_info_for_gemini = json.dumps(consolidated_detections, indent=2) if consolidated_detections else "No precise object detections available for this image."
+        objects_info_for_gemini = json.dumps(detected_objects_for_gemini, indent=2) if detected_objects_for_gemini else "No precise object detections available for this image."
 
-        # Pass custom_safety_text to the prompt generator
         prompt_text = generate_prompt_for_mode(safety_mode, custom_safety_text, objects_info_for_gemini)
         
         contents = [
@@ -529,7 +495,6 @@ def draw_highlights_on_image(original_image_path, analysis_data):
                     width = coords['width']
                     height = coords['height']
 
-                    # Ensure coordinates are within valid range [0, 1]
                     x = max(0.0, min(1.0, x))
                     y = max(0.0, min(1.0, y))
                     width = max(0.0, min(1.0 - x, width))
@@ -565,8 +530,19 @@ def draw_highlights_on_image(original_image_path, analysis_data):
         print(f"Error processing image for highlighting: {e}")
         return None
 
+def get_overall_qualitative_rating(score):
+    """Converts a numerical safety score to a qualitative rating."""
+    if score >= 90:
+        return "Excellent"
+    elif score >= 70:
+        return "Good"
+    elif score >= 50:
+        return "Fair"
+    else:
+        return "Poor"
+
 if __name__ == '__main__':
-    print("Welcome to the Combined Room Safety Analyzer (YOLO Backend - Grid Processing)!")
+    print("Welcome to the Combined Room Safety Analyzer (YOLO Backend - Full Image Processing)!")
     print("----------------------------------------------------------------------------------")
 
     image_paths_input = input("Enter the paths to your room image files, separated by a comma (e.g., /path/1.jpg, /path/2.png): ")
@@ -591,59 +567,96 @@ if __name__ == '__main__':
         print("Invalid mode selected. Defaulting to 'general'.")
         mode_input = 'general'
 
-    # Removed the confidence threshold input for YOLO
-
     all_analyses_results = {}
-    
+    all_collected_suggestions = [] 
+
     print("\n--- Starting Combined Object Detection and Gemini Analysis for Each Image ---")
     for img_path in image_paths:
         print(f"\nAnalyzing image: {os.path.basename(img_path)}")
         
-        # Call analyze_single_room_image without frcnn_conf_threshold
         analysis_result = analyze_single_room_image(img_path, safety_mode=mode_input, 
                                                     custom_safety_text=custom_safety_text)
         
         if analysis_result:
             all_analyses_results[img_path] = analysis_result
             print(f"Full analysis for {os.path.basename(img_path)} completed.")
+
+            for item in analysis_result.get('identifiedItems', []):
+                if item.get('isHazard'):
+                    all_collected_suggestions.append({
+                        'image': os.path.basename(img_path),
+                        'item': item.get('item'),
+                        'suggestion': item.get('resolutionSuggestion')
+                    })
         else:
             print(f"Full analysis for {os.path.basename(img_path)} failed.")
 
-    print("\n--- Safety Analysis Reports and Image Annotations ---")
+    # --- Consolidated Reports ---
+    print("\n\n--- Consolidated Safety Analysis Reports ---")
     if not all_analyses_results:
         print("No successful analyses were performed.")
     else:
+        total_overall_score = 0
+        num_successful_analyses = 0
         for img_path, analysis in all_analyses_results.items():
-            print(f"\n--- Report for: {os.path.basename(img_path)} ---")
+            if 'overallSafetyScore' in analysis and isinstance(analysis['overallSafetyScore'], (int, float)):
+                total_overall_score += analysis['overallSafetyScore']
+                num_successful_analyses += 1
+
+            current_image_name = os.path.basename(img_path)
+            print(f"\n--- Report for: {current_image_name} ---")
             print(f"Analysis Mode: {mode_input.replace('_', ' ').title()}")
             if mode_input == 'custom' and custom_safety_text:
                 print(f"Custom Guidelines: \"{custom_safety_text}\"")
             print(f"Overall Safety Rating: {analysis.get('overallSafetyRating', 'N/A')} (Score: {analysis.get('overallSafetyScore', 'N/A')}/100)")
-            print("\nIdentified Items:")
             
+            print("\nIdentified Hazards:")
+            hazards_found_in_room = False
             for item in analysis.get('identifiedItems', []):
-                is_hazard = item.get('isHazard', False)
-                status = "HAZARD" if is_hazard else "SAFE"
-                color_code = '\033[' + ('91m' if is_hazard else '92m')
-                reset_color = '\033[' + '0m'
-
-                print(f"- {color_code}{item.get('item')}{reset_color} (Rating: {item.get('safetyRating')}, Status: {status})")
-                if is_hazard:
-                    print(f"  Hazard: {item.get('hazardDescription')}")
-                    print(f"  Suggestion: {item.get('resolutionSuggestion')}")
+                if item.get('isHazard'):
+                    hazards_found_in_room = True
+                    color_code = '\033[91m' 
+                    reset_color = '\033[0m'
+                    print(f"- {color_code}{item.get('item')}{reset_color} (Rating: {item.get('safetyRating')})")
+                    print(f"  Hazard Description: {item.get('hazardDescription')}")
                     coordinates = item.get('coordinates')
                     if coordinates:
                         print(f"  Coordinates (x,y,w,h): ({coordinates.get('x', 'N/A'):.2f}, {coordinates.get('y', 'N/A'):.2f}, {coordinates.get('width', 'N/A'):.2f}, {coordinates.get('height', 'N/A'):.2f})")
-                print("")
-
+            if not hazards_found_in_room:
+                print("  No specific hazards identified in this room.")
+                
             print("\n--- Fun Ideas! ---")
             fun_ideas = analysis.get('funIdeas', {})
             print(f"The safest place in the room is: {fun_ideas.get('safestPlace', 'N/A')}")
             print(f"If an earthquake happens, quickly go towards: {fun_ideas.get('earthquakeSpot', 'N/A')}")
+            
+            fun_fact = analysis.get('funFactAboutRoom', 'N/A')
+            print(f"Fun Fact About {current_image_name}: {fun_fact}") 
+            
 
-            print(f"\nGenerating annotated image for {os.path.basename(img_path)}...")
+            print(f"\nGenerating annotated image for {current_image_name}...")
             annotated_file_path = draw_highlights_on_image(img_path, analysis)
             if annotated_file_path:
                 print(f"Annotated image saved to: {annotated_file_path}")
             else:
-                print(f"Failed to create annotated image for {os.path.basename(img_path)} (or no hazards with coordinates found).")
+                print(f"Failed to create annotated image for {current_image_name} (or no hazards with coordinates found).")
+            print("-" * 60) 
+
+    # --- Overall Batch Rating and Consolidated Suggestions ---
+    print("\n\n--- Overall Batch Safety Performance ---")
+    if num_successful_analyses > 0:
+        average_overall_score = total_overall_score / num_successful_analyses
+        overall_qualitative_rating = get_overall_qualitative_rating(average_overall_score)
+        print(f"Average Safety Score Across All {num_successful_analyses} Rooms: {average_overall_score:.2f}/100")
+        print(f"Overall Batch Safety Rating: {overall_qualitative_rating}")
+    else:
+        print("Could not calculate overall batch safety rating as no rooms were successfully analyzed.")
+
+    print("\n--- All Collected Resolution Suggestions ---")
+    if not all_collected_suggestions:
+        print("No resolution suggestions were collected.")
+    else:
+        for i, sug in enumerate(all_collected_suggestions):
+            print(f"[{i+1}] For '{sug['item']}' in '{sug['image']}':")
+            print(f"    Suggestion: {sug['suggestion']}")
+            print("-" * 30)
