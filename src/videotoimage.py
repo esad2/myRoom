@@ -123,6 +123,11 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
         print(f"Error: Video file not found at '{video_path}'")
         return {"error": f"Video file not found at '{video_path}'"}
 
+    # Create a directory to save hazard frames
+    hazards_output_dir = "hazards"
+    os.makedirs(hazards_output_dir, exist_ok=True)
+    print(f"Hazard frames will be saved to: {os.path.abspath(hazards_output_dir)}")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video file '{video_path}'")
@@ -191,6 +196,7 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                 frame_hazard_score = 0
                 
                 if gemini_response_data.get('hazards'):
+                    # Process and store hazard details for this frame
                     for hazard_item in gemini_response_data['hazards']:
                         desc = hazard_item.get('description', 'Unknown hazard')
                         severity = hazard_item.get('severity', 'low').lower()
@@ -205,6 +211,45 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                             "resolution_suggestion": resolution,
                             "score": score
                         })
+                    
+                    # If hazards were detected in this frame, save the frame with descriptions
+                    if current_frame_hazards:
+                        frame_filename = f"hazard_frame_{frame_number:05d}.jpg"
+                        frame_image_path = os.path.join(hazards_output_dir, frame_filename)
+                        
+                        # Prepare text for the image (first hazard's description, truncated)
+                        text_to_display = "Hazard: " + " ".join(current_frame_hazards[0]['description'].split()[:4]) # Max 4 words
+                        
+                        # Add text to the image before saving
+                        # Define font, scale, color, and thickness
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.7
+                        font_thickness = 2
+                        text_color = (0, 0, 255) # Red color (BGR)
+                        text_background_color = (0, 0, 0) # Black background for contrast
+
+                        # Get text size to create a background rectangle
+                        (text_width, text_height), baseline = cv2.getTextSize(text_to_display, font, font_scale, font_thickness)
+                        
+                        # Position for the text (top-left corner, with some padding)
+                        text_x, text_y = 10, 30
+                        
+                        # Draw filled rectangle for background
+                        cv2.rectangle(frame, (text_x, text_y - text_height - baseline), 
+                                      (text_x + text_width + 10, text_y + baseline + 10), 
+                                      text_background_color, -1)
+                        
+                        # Put text on image
+                        cv2.putText(frame, text_to_display, (text_x, text_y), 
+                                    font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+                        
+                        cv2.imwrite(frame_image_path, frame)
+                        print(f"  Saved highlighted hazard frame: {frame_image_path}")
+                        
+                        # Add image path to the stored hazard details
+                        for hazard in current_frame_hazards:
+                            hazard['image_path'] = frame_image_path
+
                     print(f"  Hazards detected in Frame {frame_number}. Frame score: {frame_hazard_score}")
                 elif gemini_response_data.get('no_hazards_message'):
                     print(f"  {gemini_response_data['no_hazards_message']} in Frame {frame_number}.")
@@ -302,8 +347,10 @@ def print_analysis_summary(results):
         for hazard in results['detected_hazards']:
             desc = hazard['description']
             severity = hazard['severity']
+            # Use image_path for uniqueness or if you want to group by specific image
+            # For this summary, let's group by description for conciseness
             if desc not in hazard_summary:
-                hazard_summary[desc] = {'count': 0, 'severities': {}, 'resolution_suggestion': hazard['resolution_suggestion']}
+                hazard_summary[desc] = {'count': 0, 'severities': {}, 'resolution_suggestion': hazard['resolution_suggestion'], 'example_image_path': hazard['image_path']}
             hazard_summary[desc]['count'] += 1
             hazard_summary[desc]['severities'][severity] = hazard_summary[desc]['severities'].get(severity, 0) + 1
         
@@ -312,6 +359,7 @@ def print_analysis_summary(results):
             for sev, count in data['severities'].items():
                 print(f"    Severity: {sev.capitalize()} ({count} occurrences)")
             print(f"    Suggested Resolution: {data['resolution_suggestion']}")
+            print(f"    Example Image: {data['example_image_path']}") # Print path to an example image
     else:
         print("No specific safety hazards were explicitly identified across the analyzed frames.")
         print("The room appears to be generally safe based on this analysis.")
@@ -330,6 +378,7 @@ def print_analysis_summary(results):
         print("No additional fun safety facts were generated.")
 
     print("\n" + "="*50)
+    print("\nNote: All detected hazard frames have been saved to the 'hazards' folder.")
 
 
 # --- Main execution ---
