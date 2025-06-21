@@ -1,45 +1,12 @@
-"""
-Room‑Safety Core – YOLO + Gemini Pipeline
-========================================
-A complete, *no‑shortcuts* implementation that:
-1. **Runs YOLO** (Ultralytics) on the uploaded image → raw object detections & bounding boxes.  
-2. **Feeds** the *image* **and** the machine‑readable detection list to **Gemini 1.5** to:
-   • Decide which detections are **hazards**.  
-   • Produce **advice** per hazard.  
-   • Return a **room‑safety rating** (A–E).  
-   • Optionally tweak/refine bboxes.
-3. **Annotates** the image (Pillow) by drawing red boxes around hazards.
-4. **Serves** everything through FastAPI – single `POST /analyze` endpoint.
-
-Setup
------
-```bash
-pip install --upgrade ultralytics google-genai fastapi uvicorn pillow python-multipart numpy pydantic
-# create .env with GOOGLE_API_KEY, GEMINI_MODEL, YOLO_MODEL (optional)
-uvicorn safety_core:app --reload  # http://127.0.0.1:8000/docs
-```
-
-Environment vars (all optional except `GOOGLE_API_KEY`)
-------------------------------------------------------
-* `GOOGLE_API_KEY` – Gemini key.
-* `GEMINI_MODEL`   – default `gemini-1.5-flash-latest`.
-* `YOLO_MODEL`     – ultralytics model name / path (default `yolov8s.pt`).
-* `LOG_LEVEL`      – `info` (default) | `debug`.
-
-Usage examples
---------------
-```bash
-# CLI demo
-python safety_core.py --demo assets/room.jpg --out out.jpg
-
-# Curl
-curl -X POST -F "file=@room.jpg" http://localhost:8000/analyze
-```
-
-Code
-----
-"""
 from __future__ import annotations
+
+"""Room‑Safety Core – YOLO + Gemini Pipeline
+
+Run YOLO to get accurate bounding boxes, then pass the image **and** the YOLO
+JSON to Gemini 1.5 (flash/pro) for hazard detection, advice, and an overall
+room‑safety rating (A–E).  Returns the annotated JPEG as base64 plus structured
+JSON.  Compatible with Google‑genai ≥ 0.6 (image‑understanding API).
+"""
 
 import base64
 import io
@@ -47,44 +14,42 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont
+from pydantic import BaseModel
 from ultralytics import YOLO
 
 from google import genai
 from google.genai import types as gtypes
 
-# ----------------------------
+# ---------------------------------------------------------------------------
 # ENV & logging
-# ----------------------------
+# ---------------------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    logging.fatal("GOOGLE_API_KEY not set – create .env or export it.")
-    sys.exit(1)
+    sys.exit("GOOGLE_API_KEY env var required – see .env.example")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL", "yolov8s.pt")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(levelname)s: %(message)s")
 logger = logging.getLogger("safety-core")
 
-# ----------------------------
-# Pydantic models
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Pydantic DTOs
+# ---------------------------------------------------------------------------
 class Box(BaseModel):
     x1: int
     y1: int
     x2: int
     y2: int
 
-    def to_list(self) -> List[int]:
+    def to_list(self):
         return [self.x1, self.y1, self.x2, self.y2]
+
 
 class Detection(BaseModel):
     id: int
@@ -92,209 +57,165 @@ class Detection(BaseModel):
     confidence: float
     box: Box
 
+
 class Hazard(BaseModel):
-    id: int  # points back to detection id
+    id: int
     label: str
-    severity: str  # low, medium, high, critical
+    severity: str
     advice: str
     box: Box
 
-class AnalysisResponse(BaseModel):
-    rating: str  # A–E
-    hazards: List[Hazard]
-    annotated_image_b64: str  # JPEG, base64‑encoded
 
-# ----------------------------
-# Detector (YOLO)
-# ----------------------------
+class AnalysisResponse(BaseModel):
+    rating: str  # A‑E
+    hazards: List[Hazard]
+    annotated_image_b64: str
+
+
+# ---------------------------------------------------------------------------
+# YOLO Detector
+# ---------------------------------------------------------------------------
 class YoloDetector:
     _model: YOLO | None = None
 
     @classmethod
-    def load_model(cls):
+    def _load(cls):
         if cls._model is None:
-            logger.info("Loading YOLO model… (%s)", YOLO_MODEL_PATH)
+            logger.info("Loading YOLO weights… %s", YOLO_MODEL_PATH)
             cls._model = YOLO(YOLO_MODEL_PATH)
         return cls._model
 
     @classmethod
     def run(cls, img: Image.Image, conf: float = 0.25) -> List[Detection]:
-        model = cls.load_model()
-        results = model.predict(img, conf=conf, verbose=False)[0]
-        detections: List[Detection] = []
-        for det_id, (xyxy, conf_score, cls_id) in enumerate(zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls)):
+        res = cls._load().predict(img, conf=conf, verbose=False)[0]
+        out: List[Detection] = []
+        for idx, (xyxy, conf_score, cls_id) in enumerate(
+            zip(res.boxes.xyxy, res.boxes.conf, res.boxes.cls)
+        ):
             x1, y1, x2, y2 = map(int, xyxy.tolist())
-            label = model.names[int(cls_id)]
-            detections.append(
+            label = res.names[int(cls_id)]
+            out.append(
                 Detection(
-                    id=det_id,
+                    id=idx,
                     label=label,
                     confidence=float(conf_score),
                     box=Box(x1=x1, y1=y1, x2=x2, y2=y2),
                 )
             )
-        logger.debug("YOLO detections: %s", detections)
-        return detections
+        logger.debug("YOLO detections: %s", out)
+        return out
 
-# ----------------------------
-# Gemini Hazard Analysis
-# ----------------------------
+
+# ---------------------------------------------------------------------------
+# Gemini Analyzer
+# ---------------------------------------------------------------------------
 class GeminiAnalyzer:
     def __init__(self, model_name: str = GEMINI_MODEL):
         logger.info("Initialising Gemini client (%s)…", model_name)
-        genai.configure(api_key=GOOGLE_API_KEY)
-        self._model = genai.GenerativeModel(model_name)
+        self._client = genai.Client(api_key=GOOGLE_API_KEY)
+        self._model = model_name
 
+    # Prompt helpers --------------------------------------------------------
     @staticmethod
-    def _detection_prompt_part(dets: List[Detection]) -> str:
-        """Return a concise, machine‑readable string for prompt conditioning."""
-        lines = [
+    def _fmt_detections(dets: List[Detection]) -> str:
+        header = "#id\tlabel\tconfidence\tx1,y1,x2,y2 (px)"
+        rows = [
             f"{d.id}\t{d.label}\t{d.confidence:.3f}\t{','.join(map(str, d.box.to_list()))}"
             for d in dets
         ]
-        header = "#id\tlabel\tconfidence\tx1,y1,x2,y2 (pixels)"
-        return header + "\n" + "\n".join(lines)
+        return header + "\n" + "\n".join(rows)
 
-    @staticmethod
-    def _build_prompt(dets: List[Detection]) -> str:
-        # Clear instructions to output strict JSON
-        prompt = f"""
-You are a safety‑risk expert. Based on the image and the raw detections below, identify which objects are hazards.
-Return ONLY valid JSON matching this schema (no markdown or comments):
-{{
-  "rating": "A|B|C|D|E",
-  "hazards": [
-    {{
-      "id": <detection id>,
-      "label": "<same label as detection>",
-      "severity": "low|medium|high|critical",
-      "advice": "short actionable tip",
-      "box": [x1, y1, x2, y2]
-    }}
-  ]
-}}
-Guidelines:
-- Consider context (e.g., a plugged‑in iron on a wooden table is a fire hazard).
-- If object is benign, omit it from hazards.
-- rating =
-    A (no hazards),
-    B (minor),
-    C (moderate),
-    D (major),
-    E (critical).
+    def _make_prompt(self, dets: List[Detection]) -> str:
+        return (
+            "You are a room‑safety inspector. Using the image and the detection list, "
+            "flag ONLY hazardous objects, suggest a fix, and grade the room (A=no issues … E=critical). "
+            "Return *strict* JSON matching this schema:\n"
+            "{\"rating\":\"A|B|C|D|E\", \"hazards\":[{\"id\":<int>, \"label\":<str>, "
+            "\"severity\":\"low|medium|high|critical\", \"advice\":<str>, \"box\":[x1,y1,x2,y2]}]}\n\n"
+            "Detections:\n" + self._fmt_detections(dets)
+        )
 
-Raw detections:\n""".strip()
-        prompt += "\n\n" + GeminiAnalyzer._detection_prompt_part(dets)
-        return prompt
-
-    def analyze(self, img: Image.Image, dets: List[Detection]) -> Tuple[AnalysisResponse, List[Hazard]]:
-        logger.info("Calling Gemini for hazard analysis…")
-        # Prepare parts: image + text prompt
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format="JPEG")
-        img_data = img_bytes.getvalue()
-
+    def analyze(self, img: Image.Image, dets: List[Detection]) -> AnalysisResponse:
+        img_bytes = io.BytesIO(); img.save(img_bytes, format="JPEG")
         parts = [
-            gtypes.Part.from_bytes(data=img_data, mime_type="image/jpeg"),
-            gtypes.Part.from_text(self._build_prompt(dets)),
+            gtypes.Part.from_bytes(img_bytes.getvalue(), mime_type="image/jpeg"),
+            self._make_prompt(dets),
         ]
+        cfg = gtypes.GenerateContentConfig(response_mime_type="application/json")
+        rsp = self._client.models.generate_content(
+            model=self._model, contents=parts, config=cfg
+        )
+        if not rsp.text:
+            raise RuntimeError("Gemini returned empty response")
+        logger.debug("Gemini raw: %s", rsp.text)
+        payload = json.loads(rsp.text)
+        hazards = [
+            Hazard(
+                id=h["id"],
+                label=h["label"],
+                severity=h["severity"],
+                advice=h["advice"],
+                box=Box(x1=h["box"][0], y1=h["box"][1], x2=h["box"][2], y2=h["box"][3]),
+            )
+            for h in payload.get("hazards", [])
+        ]
+        annotated = self._draw(img.copy(), hazards)
+        return AnalysisResponse(rating=payload["rating"], hazards=hazards, annotated_image_b64=annotated)
 
-        config = gtypes.GenerateContentRequest.Config(response_mime_type="application/json")
-        response = self._model.generate_content(parts=parts, generation_config=config)
-        if not response.candidates:
-            raise RuntimeError("Gemini returned no candidates")
-        raw_json = response.candidates[0].text.strip()
-        logger.debug("Gemini raw JSON: %s", raw_json)
-        try:
-            parsed = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            logger.error("Gemini JSON parse error: %s", exc)
-            raise RuntimeError("Gemini response JSON malformed") from exc
-
-        hazards = [Hazard(id=h["id"], label=h["label"], severity=h["severity"], advice=h["advice"],
-                          box=Box(x1=h["box"][0], y1=h["box"][1], x2=h["box"][2], y2=h["box"][3]))
-                   for h in parsed.get("hazards", [])]
-
-        # Draw annotated image (only hazards)
-        annotated_b64 = self._annotate_image(img, hazards)
-
-        analysis = AnalysisResponse(rating=parsed["rating"], hazards=hazards, annotated_image_b64=annotated_b64)
-        return analysis, hazards
-
+    # Annotation ------------------------------------------------------------
     @staticmethod
-    def _annotate_image(img: Image.Image, hazards: List[Hazard]) -> str:
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
-        for haz in hazards:
-            box = haz.box
-            draw.rectangle([box.x1, box.y1, box.x2, box.y2], outline="red", width=3)
-            draw.text((box.x1, max(box.y1 - 10, 0)), f"{haz.label} ({haz.severity})", fill="red", font=font)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
+    def _draw(img: Image.Image, hazards: List[Hazard]) -> str:
+        d = ImageDraw.Draw(img); font = ImageFont.load_default()
+        for h in hazards:
+            b = h.box
+            d.rectangle([b.x1, b.y1, b.x2, b.y2], outline="red", width=3)
+            d.text((b.x1, max(0, b.y1 - 12)), f"{h.label} ({h.severity})", fill="red", font=font)
+        buf = io.BytesIO(); img.save(buf, format="JPEG")
         return base64.b64encode(buf.getvalue()).decode()
 
-# ----------------------------
-# Orchestrator
-# ----------------------------
+
+# ---------------------------------------------------------------------------
+# Pipeline & FastAPI
+# ---------------------------------------------------------------------------
 class SafetyPipeline:
     def __init__(self):
         self.detector = YoloDetector()
         self.analyzer = GeminiAnalyzer()
 
-    def analyze_image(self, img: Image.Image) -> AnalysisResponse:
-        detections = self.detector.run(img)
-        analysis, _ = self.analyzer.analyze(img, detections)
-        return analysis
+    def analyze(self, img: Image.Image) -> AnalysisResponse:
+        dets = self.detector.run(img)
+        return self.analyzer.analyze(img, dets)
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
-app = FastAPI(title="Room‑Safety Analyzer", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-pipeline = SafetyPipeline()
+app = FastAPI(title="Room‑Safety Analyzer", version="2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+pipe = SafetyPipeline()
+
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(file: UploadFile = File(...)):
     try:
-        img = Image.open(await file.read()).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid image file") from exc
+        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+        return pipe.analyze(img)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Analysis error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    try:
-        result = pipeline.analyze_image(img)
-    except Exception as exc:
-        logger.error("Analysis failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return result
-
-# ----------------------------
-# CLI helper
-# ----------------------------
 if __name__ == "__main__":
     import argparse
+    import base64 as b64
 
-    parser = argparse.ArgumentParser(description="Room‑Safety analyzer demo")
-    parser.add_argument("--demo", type=str, help="Path to input image")
-    parser.add_argument("--out", type=str, default="annotated.jpg", help="Output annotated image path")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--demo", required=True)
+    p.add_argument("--out", default="annotated.jpg")
+    args = p.parse_args()
 
-    if not args.demo:
-        print("--demo path required")
-        sys.exit(1)
-
-    img = Image.open(args.demo).convert("RGB")
-    pipe = SafetyPipeline()
-    response = pipe.analyze_image(img)
-    print(json.dumps(response.dict(), indent=2))
-
-    # Save annotated image
+    im = Image.open(args.demo).convert("RGB")
+    res = SafetyPipeline().analyze(im)
+    print(json.dumps(res.dict(), indent=2))
     with open(args.out, "wb") as f:
-        f.write(base64.b64decode(response.annotated_image_b64))
-    print(f"Annotated image saved to {args.out}")
+        f.write(b64.b64decode(res.annotated_image_b64))
+    print("Saved →", args.out)
