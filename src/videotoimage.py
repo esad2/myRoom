@@ -114,6 +114,21 @@ def get_gemini_text_response(prompt, context_text=""):
         # print(f"Raw response: {response.text if 'response' in locals() else 'No response object'}") # Uncomment for verbose debugging
         return None
 
+def get_short_summary_from_gemini(long_text, max_words=5):
+    """
+    Uses Gemini API to generate a short, N-word summary of the given text.
+    """
+    summary_prompt = (
+        f"Summarize the following safety hazard description into a maximum of {max_words} words. "
+        "Make it concise and clear. Do not include 'Hazard:' or 'Summary:'.\n\n"
+        f"Description: {long_text}"
+    )
+    summary = get_gemini_text_response(summary_prompt)
+    if summary:
+        # Ensure it's still max N words, just in case AI goes over
+        return " ".join(summary.strip().split()[:max_words])
+    return "Hazard Detected" # Fallback if summary generation fails
+
 def analyze_video_frames(video_path, frame_sample_rate=30):
     """
     Analyzes video frames for hazards using the Gemini API.
@@ -217,8 +232,10 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                         frame_filename = f"hazard_frame_{frame_number:05d}.jpg"
                         frame_image_path = os.path.join(hazards_output_dir, frame_filename)
                         
-                        # Prepare text for the image (first hazard's description, truncated)
-                        text_to_display = "Hazard: " + " ".join(current_frame_hazards[0]['description'].split()[:4]) # Max 4 words
+                        # Use Gemini to generate a short, 5-word summary for the overlay
+                        # We'll summarize the description of the *first* detected hazard in this frame
+                        short_summary = get_short_summary_from_gemini(current_frame_hazards[0]['description'], max_words=5)
+                        text_to_display = short_summary
                         
                         # Add text to the image before saving
                         # Define font, scale, color, and thickness
