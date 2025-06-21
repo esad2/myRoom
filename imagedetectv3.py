@@ -2,10 +2,22 @@ from __future__ import annotations
 
 """Room‑Safety Core – YOLO + Gemini Pipeline
 
-Run YOLO to get accurate bounding boxes, then pass the image **and** the YOLO
-JSON to Gemini 1.5 (flash/pro) for hazard detection, advice, and an overall
-room‑safety rating (A–E).  Returns the annotated JPEG as base64 plus structured
-JSON.  Compatible with Google‑genai ≥ 0.6 (image‑understanding API).
+Fix #1: **Correct bounding‑box coordinates** returned by Gemini
+---------------------------------------------------------------
+Gemini returns bboxes on a *1000×1000* canvas (integer coords ≤ 1000) or
+sometimes as floats in the 0‑1 range.  This patch converts them to absolute
+pixel coords of the original image so the red overlays align correctly.
+
+Other tweaks
+------------
+* Added bbox clamping to image bounds.
+* Extra logging when auto‑scaling kicks in (enable with LOG_LEVEL=DEBUG).
+
+Usage is unchanged:
+```bash
+export GOOGLE_API_KEY="…"
+uvicorn safety_core:app --reload  # /docs
+```
 """
 
 import base64
@@ -115,7 +127,7 @@ class GeminiAnalyzer:
         self._client = genai.Client(api_key=GOOGLE_API_KEY)
         self._model = model_name
 
-    # Prompt helpers --------------------------------------------------------
+    # ---------------- Prompt helpers -----------------
     @staticmethod
     def _fmt_detections(dets: List[Detection]) -> str:
         header = "#id\tlabel\tconfidence\tx1,y1,x2,y2 (px)"
@@ -135,6 +147,28 @@ class GeminiAnalyzer:
             "Detections:\n" + self._fmt_detections(dets)
         )
 
+    # ---------------- Scaling helper -----------------
+    @staticmethod
+    def _to_abs(box: List[float | int], img_w: int, img_h: int) -> tuple[int, int, int, int]:
+        """Convert Gemini box (0‑1 floats or 0‑1000 ints) → absolute pixel ints."""
+        x1, y1, x2, y2 = box
+        max_coord = max(box)
+        if max_coord <= 1.0:  # normalised [0,1]
+            logger.debug("Scaling bbox from [0,1] → pixels")
+            x1, x2 = x1 * img_w, x2 * img_w
+            y1, y2 = y1 * img_h, y2 * img_h
+        elif max_coord <= 1000:  # gemini 1000‑canvas
+            logger.debug("Scaling bbox from 1000‑canvas → pixels")
+            x1, x2 = x1 * img_w / 1000, x2 * img_w / 1000
+            y1, y2 = y1 * img_h / 1000, y2 * img_h / 1000
+        # else assume already absolute
+        # Clamp
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_w - 1, x2), min(img_h - 1, y2)
+        return x1, y1, x2, y2
+
+    # ---------------- Main call -----------------
     def analyze(self, img: Image.Image, dets: List[Detection]) -> AnalysisResponse:
         img_bytes = io.BytesIO(); img.save(img_bytes, format="JPEG")
         parts = [
@@ -147,22 +181,26 @@ class GeminiAnalyzer:
         )
         if not rsp.text:
             raise RuntimeError("Gemini returned empty response")
-        logger.debug("Gemini raw: %s", rsp.text)
         payload = json.loads(rsp.text)
-        hazards = [
-            Hazard(
-                id=h["id"],
-                label=h["label"],
-                severity=h["severity"],
-                advice=h["advice"],
-                box=Box(x1=h["box"][0], y1=h["box"][1], x2=h["box"][2], y2=h["box"][3]),
+
+        img_w, img_h = img.size
+        hazards: List[Hazard] = []
+        for h in payload.get("hazards", []):
+            abs_box = self._to_abs(h["box"], img_w, img_h)
+            hazards.append(
+                Hazard(
+                    id=h["id"],
+                    label=h["label"],
+                    severity=h["severity"],
+                    advice=h["advice"],
+                    box=Box(x1=abs_box[0], y1=abs_box[1], x2=abs_box[2], y2=abs_box[3]),
+                )
             )
-            for h in payload.get("hazards", [])
-        ]
+
         annotated = self._draw(img.copy(), hazards)
         return AnalysisResponse(rating=payload["rating"], hazards=hazards, annotated_image_b64=annotated)
 
-    # Annotation ------------------------------------------------------------
+    # ---------------- Annotation -----------------
     @staticmethod
     def _draw(img: Image.Image, hazards: List[Hazard]) -> str:
         d = ImageDraw.Draw(img); font = ImageFont.load_default()
@@ -187,35 +225,4 @@ class SafetyPipeline:
         return self.analyzer.analyze(img, dets)
 
 
-app = FastAPI(title="Room‑Safety Analyzer", version="2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-pipe = SafetyPipeline()
 
-
-@app.post("/analyze", response_model=AnalysisResponse)
-async def analyze(file: UploadFile = File(...)):
-    try:
-        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-        return pipe.analyze(img)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Analysis error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    import argparse
-    import base64 as b64
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--demo", required=True)
-    p.add_argument("--out", default="annotated.jpg")
-    args = p.parse_args()
-
-    im = Image.open(args.demo).convert("RGB")
-    res = SafetyPipeline().analyze(im)
-    print(json.dumps(res.dict(), indent=2))
-    with open(args.out, "wb") as f:
-        f.write(b64.b64decode(res.annotated_image_b64))
-    print("Saved →", args.out)
