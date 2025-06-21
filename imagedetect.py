@@ -20,7 +20,6 @@ except Exception as e:
     yolo_model = None
 
 # Define the expected JSON schema for the Gemini response (per-image)
-# Note: The funIdeas will still be generic, as they aren't tied to a specific image's hazards
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -160,7 +159,6 @@ def generate_prompt_for_mode(safety_mode, yolo_detections_info=None):
     # Default to general OSHA-style safety
     return base_prompt + "\n\n**Mode: General Workplace Safety.** Focus on common trip hazards, fire safety, and electrical risks."
 
-# *** MODIFIED FUNCTION TO ANALYZE EACH IMAGE INDIVIDUALLY ***
 def analyze_single_room_image(image_file_path, safety_mode='general', yolo_detections_for_image=None):
     """
     Analyzes a single room image file for safety risks using the Gemini API.
@@ -300,41 +298,58 @@ if __name__ == '__main__':
         print("Invalid mode selected. Defaulting to 'general'.")
         mode_input = 'general'
 
+    # --- NEW: Define YOLO confidence thresholds to iterate through ---
+    # These values ensure YOLO explores detections at different confidence levels.
+    # Higher conf value means more strict, lower means more permissive.
+    yolo_confidence_thresholds = [0.5, 0.25, 0.1] # Run 3 times with decreasing thresholds
+    print(f"\nYOLO will run {len(yolo_confidence_thresholds)} times for each image with confidence thresholds: {yolo_confidence_thresholds}")
+
+
     # Store analysis results for each image
     all_analyses_results = {}
     
     # Step 1: Run YOLO on all images upfront and store detections by image path
     yolo_detections_by_image = {}
     if yolo_model:
-        print("Pre-processing all images with YOLOv8 for precise object detection...")
+        print("\nPre-processing all images with YOLOv8 for precise object detection...")
         for img_path in image_paths:
             if not os.path.exists(img_path):
                 print(f"Warning: File not found at '{img_path}'. Skipping YOLO detection for this file.")
                 continue
             
-            current_image_detections = []
-            try:
-                results = yolo_model(img_path, verbose=False)
-                if results and results[0].boxes:
-                    for box in results[0].boxes:
-                        xywhn = box.xywhn[0].tolist()
-                        obj_class_id = int(box.cls[0].item())
-                        obj_name = yolo_model.names[obj_class_id]
+            # Use a set to store unique detections to avoid duplicates from different thresholds
+            unique_detections_for_image = set() # Store as JSON strings for hashability
 
-                        yolo_width = xywhn[2]
-                        yolo_height = xywhn[3]
-                        yolo_x = xywhn[0] - (yolo_width / 2)
-                        yolo_y = xywhn[1] - (yolo_height / 2)
+            for conf_thresh in yolo_confidence_thresholds:
+                try:
+                    # *** KEY CHANGE: Iterate through confidence thresholds ***
+                    results = yolo_model(img_path, verbose=False, conf=conf_thresh)
+                    if results and results[0].boxes:
+                        for box in results[0].boxes:
+                            xywhn = box.xywhn[0].tolist()
+                            obj_class_id = int(box.cls[0].item())
+                            obj_name = yolo_model.names[obj_class_id]
 
-                        current_image_detections.append({
-                            "name": obj_name,
-                            "confidence": float(box.conf[0].item()),
-                            "coordinates": {"x": yolo_x, "y": yolo_y, "width": yolo_width, "height": yolo_height}
-                        })
-                yolo_detections_by_image[img_path] = current_image_detections
-            except Exception as e:
-                print(f"Error running YOLOv8 on {img_path}: {e}")
-                yolo_detections_by_image[img_path] = [] # Store empty list on error
+                            yolo_width = xywhn[2]
+                            yolo_height = xywhn[3]
+                            yolo_x = xywhn[0] - (yolo_width / 2)
+                            yolo_y = xywhn[1] - (yolo_height / 2)
+
+                            detection_data = {
+                                "name": obj_name,
+                                "confidence": float(box.conf[0].item()),
+                                "coordinates": {"x": round(yolo_x, 4), "y": round(yolo_y, 4), "width": round(yolo_width, 4), "height": round(yolo_height, 4)}
+                            }
+                            # Convert to JSON string for set to handle uniqueness (round floats for consistency)
+                            unique_detections_for_image.add(json.dumps(detection_data, sort_keys=True))
+                except Exception as e:
+                    print(f"Error running YOLOv8 with conf={conf_thresh} on {img_path}: {e}")
+            
+            # Convert set of JSON strings back to list of dicts
+            yolo_detections_by_image[img_path] = [json.loads(s) for s in unique_detections_for_image]
+            if not yolo_detections_by_image[img_path]:
+                print(f"No objects detected by YOLO for {os.path.basename(img_path)} at any threshold.")
+
 
     # Step 2: Analyze each image individually with Gemini
     print("\n--- Starting Gemini Analysis for Each Image ---")
