@@ -1,0 +1,69 @@
+/* src/pages/HomePage.module.css */
+
+.container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  padding: 2rem;
+  text-align: center;
+}
+
+.title {
+  font-family: 'Poppins', sans-serif;
+  font-size: 4rem;
+  font-weight: 700;
+  color: #1a2a4c;
+  margin: 0;
+}
+
+.subtitle {
+  font-family: 'Poppins', sans-serif;
+  font-size: 1.25rem;
+  color: #5a6b8c;
+  margin-top: 0.5rem;
+  margin-bottom: 3rem;
+  max-width: 600px;
+}
+
+/* Dosya Yükleyici Stilleri */
+.fileUploader {
+  width: 100%;
+  max-width: 550px;
+  background: white;
+  padding: 2rem;
+  border-radius: 16px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+}
+
+.fileInputWrapper {
+  border: 2px dashed #dce4f2;
+  border-radius: 12px;
+  padding: 3rem 2rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: #5a6b8c;
+}
+
+.fileInputWrapper:hover {
+  border-color: #2AC795;
+  background-color: #fcfdff;
+}
+
+.uploadText {
+  font-weight: 500;
+  font-size: 1.1rem;
+}
+
+.fileName {
+  color: #2AC795;
+  font-weight: 600;
+}
+
+.error {
+  color: #e74c3c;
+  margin-top: 1rem;
+  font-weight: 500;
+}

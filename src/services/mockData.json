@@ -1,0 +1,38 @@
+
+{
+  "scanId": "scan_12345",
+  "imageUrl": "https://i.imgur.com/g4mX3s5.jpeg",
+  "analysisTimestamp": "2025-06-21T21:50:00Z",
+  "scores": {
+    "overall": 78,
+    "categories": {
+      "fallAndTrip": 85,
+      "electrical": 60,
+      "fireEgress": 90
+    }
+  },
+  "hazards": [
+    {
+      "id": "haz_01",
+      "category": "electrical",
+      "severity": "High",
+      "boundingBox": { "top": "60%", "left": "35%", "width": "15%", "height": "10%" },
+      "description": "Exposed wiring near the power outlet.",
+      "remediation": "Immediately cover exposed wires with electrical tape and consult an electrician.",
+      "oshaStandard": "29 CFR 1910.303(b)(1)"
+    },
+    {
+      "id": "haz_02",
+      "category": "fallAndTrip",
+      "severity": "Medium",
+      "boundingBox": { "top": "85%", "left": "20%", "width": "50%", "height": "5%" },
+      "description": "Loose cables creating a trip hazard on the floor.",
+      "remediation": "Use cable organizers or covers to secure the cables along the wall.",
+      "oshaStandard": "29 CFR 1910.22(a)(1)"
+    }
+  ],
+  "funFacts": {
+    "safestSpot": "Under the sturdy wooden desk.",
+    "earthquakeTip": "During an earthquake, seek shelter under the desk, away from windows."
+  }
+}
