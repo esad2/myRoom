@@ -1,24 +1,15 @@
+# videtoimage.py
 import cv2
 import base64
 import requests
 import os
 import json
 import time
-import shutil # Import shutil for directory operations
+import shutil
+import tempfile # For creating temporary files reliably
 
 # --- Configuration ---
-# IMPORTANT:
-# If you are running this script outside of the Google Canvas environment (e.g., directly from your terminal),
-# you NEED to paste your own Google Gemini API Key below.
-#
-# How to get your API Key:
-# 1. Go to Google AI Studio: https://aistudio.google.com/
-# 2. Log in with your Google account.
-# 3. On the left sidebar, click "Get API Key".
-# 4. Create a new API key or copy an existing one.
-# 5. Paste it below, replacing the empty string.
-# Example: API_KEY = "YOUR_PASTED_API_KEY_HERE"
-API_KEY = "AIzaSyDrkOhq-UnBx3_vzLRvqx7GNECv1BX_Y9Y" # <--- PASTE YOUR GEMINI API KEY HERE IF RUNNING LOCALLY!
+API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY_HERE") # IMPORTANT: Use environment variable
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
 
 # Define safety hazard categories and their severity scores
@@ -37,10 +28,10 @@ BACKOFF_FACTOR = 1.0 # Initial delay for exponential backoff (e.g., 1s, 2s, 4s, 
 def make_gemini_request(url, headers, payload, is_json_response=True):
     """
     Handles API requests to Gemini with retry logic for Too Many Requests errors.
+    (This function is duplicated in both, consider moving to a common 'utils.py' if possible)
     """
-    if not API_KEY:
-        print("\nERROR: API_KEY is missing. Please paste your Gemini API key in the script.")
-        print("Refer to the instructions in the 'Configuration' section of the code.")
+    if not API_KEY or API_KEY == "YOUR_API_KEY_HERE":
+        print("\nERROR: GEMINI_API_KEY is missing. Please set it as an environment variable.")
         return None
 
     api_url_with_key = f"{url}?key={API_KEY}"
@@ -51,7 +42,8 @@ def make_gemini_request(url, headers, payload, is_json_response=True):
             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
             if is_json_response:
-                return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
+                response_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                return json.loads(response_text)
             else:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
 
@@ -61,13 +53,12 @@ def make_gemini_request(url, headers, payload, is_json_response=True):
                 if response.status_code == 403:
                     print("This usually means your API key is invalid, or the Gemini API is not enabled for your project.")
                     print("Please ensure your API key is correct and that the Gemini API is enabled in Google Cloud Console.")
-                    return None # Critical error, no point in retrying
+                    return None
                 elif response.status_code == 429:
                     wait_time = BACKOFF_FACTOR * (2 ** attempt)
                     print(f"Rate limit hit (429). Retrying in {wait_time:.1f} seconds...")
                     time.sleep(wait_time)
                 else:
-                    # Other HTTP errors, maybe retry, maybe not depending on specific error type
                     print(f"Unhandled HTTP error: {response.status_code}. Retrying...")
                     wait_time = BACKOFF_FACTOR * (2 ** attempt)
                     time.sleep(wait_time)
@@ -127,7 +118,6 @@ def get_gemini_text_response(prompt, context_text=""):
     }
     return make_gemini_request(GEMINI_API_URL, headers, payload, is_json_response=False)
 
-
 def get_short_summary_from_gemini(long_text, max_words=5):
     """
     Uses Gemini API to generate a short, N-word summary of the given text.
@@ -139,43 +129,40 @@ def get_short_summary_from_gemini(long_text, max_words=5):
     )
     summary = get_gemini_text_response(summary_prompt)
     if summary:
-        # Ensure it's still max N words, just in case AI goes over
         return " ".join(summary.strip().split()[:max_words])
-    return "Hazard Detected" # Fallback if summary generation fails
-
-def clear_hazards_directory(directory="hazards"):
-    """
-    Removes the specified directory and its contents, then recreates it.
-    This effectively "resets" the hazards folder for a new run.
-    """
-    if os.path.exists(directory):
-        print(f"Clearing existing '{directory}' folder...")
-        shutil.rmtree(directory)
-    os.makedirs(directory, exist_ok=True)
-    print(f"Clean '{directory}' folder created at: {os.path.abspath(directory)}")
+    return "Hazard Detected"
 
 
-def analyze_video_frames(video_path, frame_sample_rate=30):
+def analyze_video_frames(video_bytes: bytes, frame_sample_rate: int = 30):
     """
     Analyzes video frames for hazards using the Gemini API.
     frame_sample_rate: Analyze every Nth frame (e.g., 30 for every second at 30fps).
+    Returns:
+        dict: A dictionary containing the video analysis results.
     """
-    if not os.path.exists(video_path):
-        print(f"Error: Video file not found at '{video_path}'")
-        return {"error": f"Video file not found at '{video_path}'"}
+    # Create a temporary file to save the video bytes so OpenCV can read it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
+        temp_video_file.write(video_bytes)
+        temp_video_path = temp_video_file.name
 
-    # Clear and recreate the hazards directory at the start of analysis
-    hazards_output_dir = "hazards"
-    clear_hazards_directory(hazards_output_dir)
-    
-    cap = cv2.VideoCapture(video_path)
+    # Create a temporary directory for hazard frames for this specific analysis run
+    # This ensures isolation between requests
+    temp_hazards_dir = tempfile.mkdtemp(prefix="video_hazards_")
+
+    print(f"Temporary video saved to: {temp_video_path}")
+    print(f"Temporary hazard frames will be saved to: {temp_hazards_dir}")
+
+    cap = cv2.VideoCapture(temp_video_path)
     if not cap.isOpened():
-        print(f"Error: Could not open video file '{video_path}'")
-        return {"error": f"Could not open video file '{video_path}'"}
+        print(f"Error: Could not open temporary video file '{temp_video_path}'")
+        # Clean up temporary files before returning
+        os.remove(temp_video_path)
+        shutil.rmtree(temp_hazards_dir)
+        return {"error": f"Could not open video file '{os.path.basename(temp_video_path)}'"}
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"\nProcessing video: {os.path.basename(video_path)}")
+    print(f"\nProcessing video: {os.path.basename(temp_video_path)}")
     print(f"Total frames: {frame_count}, FPS: {fps:.2f}")
 
     total_hazard_score = 0
@@ -255,7 +242,7 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                     # If hazards were detected in this frame, save the frame with descriptions
                     if current_frame_hazards:
                         frame_filename = f"hazard_frame_{frame_number:05d}.jpg"
-                        frame_image_path = os.path.join(hazards_output_dir, frame_filename)
+                        frame_image_path = os.path.join(temp_hazards_dir, frame_filename)
                         
                         # Use Gemini to generate a short, 5-word summary for the overlay
                         # We'll summarize the description of the *first* detected hazard in this frame
@@ -263,34 +250,37 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
                         text_to_display = short_summary
                         
                         # Add text to the image before saving
-                        # Define font, scale, color, and thickness
                         font = cv2.FONT_HERSHEY_SIMPLEX
                         font_scale = 0.7
                         font_thickness = 2
                         text_color = (0, 0, 255) # Red color (BGR)
                         text_background_color = (0, 0, 0) # Black background for contrast
 
-                        # Get text size to create a background rectangle
                         (text_width, text_height), baseline = cv2.getTextSize(text_to_display, font, font_scale, font_thickness)
                         
-                        # Position for the text (top-left corner, with some padding)
                         text_x, text_y = 10, 30
                         
-                        # Draw filled rectangle for background
                         cv2.rectangle(frame, (text_x, text_y - text_height - baseline), 
-                                      (text_x + text_width + 10, text_y + baseline + 10), 
-                                      text_background_color, -1)
+                                        (text_x + text_width + 10, text_y + baseline + 10), 
+                                        text_background_color, -1)
                         
-                        # Put text on image
                         cv2.putText(frame, text_to_display, (text_x, text_y), 
-                                    font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+                                        font, font_scale, text_color, font_thickness, cv2.LINE_AA)
                         
                         cv2.imwrite(frame_image_path, frame)
                         print(f"  Saved highlighted hazard frame: {frame_image_path}")
                         
-                        # Add image path to the stored hazard details
+                        # Add image path to the stored hazard details (will be base64 encoded by main.py)
+                        # No, we will base64 encode it here directly for web-compatibility
+                        with open(frame_image_path, "rb") as f:
+                            encoded_frame = base64.b64encode(f.read()).decode('utf-8')
+                        
+                        # Add base64 encoded image directly to the hazard dict
                         for hazard in current_frame_hazards:
-                            hazard['image_path'] = frame_image_path
+                            hazard['hazard_frame_base64'] = encoded_frame
+                        
+                        # Clean up the temporary image file immediately after encoding
+                        os.remove(frame_image_path)
 
                     print(f"  Hazards detected in Frame {frame_number}. Frame score: {frame_hazard_score}")
                 elif gemini_response_data.get('no_hazards_message'):
@@ -305,25 +295,29 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
             else:
                 print(f"  Failed to get or parse Gemini response for Frame {frame_number}.")
             
-            # Add a small delay to avoid hitting rate limits too quickly, if applicable
-            # This is separate from exponential backoff for 429 errors.
-            time.sleep(0.1) 
+            time.sleep(0.1) # Small delay to avoid hitting rate limits too quickly
 
         frame_number += 1
 
     cap.release()
     cv2.destroyAllWindows()
 
-    print("\n--- Analysis Complete ---")
+    print("\n--- Video Analysis Complete ---")
+
+    # Clean up temporary video file
+    os.remove(temp_video_path)
+    print(f"Cleaned up temporary video file: {temp_video_path}")
 
     if analyzed_frames == 0:
+        # Clean up temporary hazard directory if no frames were analyzed
+        shutil.rmtree(temp_hazards_dir)
         return {"error": "No frames were successfully analyzed for hazards or video was too short."}
 
     # Calculate overall room safety score
     average_hazard_score_per_frame = total_hazard_score / analyzed_frames
     
-    # Invert the score: higher hazard score means lower safety.
     max_possible_score_per_frame = max(HAZARD_SCORES.values()) if HAZARD_SCORES else 1
+    # Safety is inverse of hazard: 100% - (hazard_ratio * 100)
     safety_percentage = max(0, 100 - (average_hazard_score_per_frame / max_possible_score_per_frame) * 100)
     
     # Generate "fun ideas" based on the overall analysis and hazards found
@@ -347,7 +341,6 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
         })
     )
     
-    # Using text-only API for fun ideas as it's not visual analysis
     fun_ideas_response_raw = get_gemini_text_response(fun_idea_prompt, context_text=fun_idea_context)
     fun_ideas_data = {}
     if fun_ideas_response_raw:
@@ -358,84 +351,18 @@ def analyze_video_frames(video_path, frame_sample_rate=30):
             fun_ideas_data = {"safest_place": "N/A", "earthquake_spot": "N/A", "other_fun_facts": ["Could not generate fun facts."]}
     else:
         fun_ideas_data = {"safest_place": "N/A", "earthquake_spot": "N/A", "other_fun_facts": ["Failed to generate fun facts."]}
+    
+    # Clean up the temporary hazard directory before returning
+    shutil.rmtree(temp_hazards_dir)
+    print(f"Cleaned up temporary hazard directory: {temp_hazards_dir}")
 
     return {
         "status": "success",
         "overall_room_safety_score": round(safety_percentage, 2),
         "total_analyzed_frames": analyzed_frames,
         "total_video_frames": frame_count,
-        "detected_hazards": all_detected_hazards,
+        "detected_hazards": all_detected_hazards, # These hazards now contain 'hazard_frame_base64'
         "fun_safety_insights": fun_ideas_data
     }
 
-def print_analysis_summary(results):
-    """
-    Prints a formatted summary of the analysis results to the terminal.
-    """
-    if results.get("error"):
-        print(f"\nERROR: {results['error']}")
-        return
-
-    print("\n" + "="*50)
-    print("        AI-POWERED ROOM SAFETY ANALYSIS REPORT")
-    print("="*50)
-    
-    print(f"\nOverall Room Safety Score: {results['overall_room_safety_score']:.2f}%")
-    print(f"Analyzed {results['total_analyzed_frames']} out of {results['total_video_frames']} video frames.")
-
-    print("\n--- Detected Safety Hazards ---")
-    if results['detected_hazards']:
-        # Group hazards by description for a cleaner summary
-        hazard_summary = {}
-        for hazard in results['detected_hazards']:
-            desc = hazard['description']
-            severity = hazard['severity']
-            # Use image_path for uniqueness or if you want to group by specific image
-            # For this summary, let's group by description for conciseness
-            if desc not in hazard_summary:
-                hazard_summary[desc] = {'count': 0, 'severities': {}, 'resolution_suggestion': hazard['resolution_suggestion'], 'example_image_path': hazard['image_path']}
-            hazard_summary[desc]['count'] += 1
-            hazard_summary[desc]['severities'][severity] = hazard_summary[desc]['severities'].get(severity, 0) + 1
-        
-        for desc, data in hazard_summary.items():
-            print(f"\n- Hazard: {desc} (Detected {data['count']} times)")
-            for sev, count in data['severities'].items():
-                print(f"    Severity: {sev.capitalize()} ({count} occurrences)")
-            print(f"    Suggested Resolution: {data['resolution_suggestion']}")
-            print(f"    Example Image: {data['example_image_path']}") # Print path to an example image
-    else:
-        print("No specific safety hazards were explicitly identified across the analyzed frames.")
-        print("The room appears to be generally safe based on this analysis.")
-
-    print("\n--- Fun Safety Insights ---")
-    fun_insights = results['fun_safety_insights']
-    print(f"Safest Place in the Room: {fun_insights.get('safest_place', 'N/A')}")
-    print(f"If an Earthquake Happens, Quickly Go Towards: {fun_insights.get('earthquake_spot', 'N/A')}")
-    
-    other_facts = fun_insights.get('other_fun_facts')
-    if other_facts and isinstance(other_facts, list) and other_facts:
-        print("Other Fun Safety Facts:")
-        for fact in other_facts:
-            print(f"- {fact}")
-    else:
-        print("No additional fun safety facts were generated.")
-
-    print("\n" + "="*50)
-    print("\nNote: All detected hazard frames have been saved to the 'hazards' folder.")
-
-
-# --- Main execution ---
-if __name__ == "__main__":
-    print("Welcome to the AI-Powered Video Safety Hazard Detector (Terminal Version)!")
-    print("This tool will analyze a video frame by frame for potential safety hazards.")
-    print("Results will be printed directly to this terminal.")
-    print("Be aware that processing can be time-consuming and consumes API credits.")
-
-    video_file_path = input("\nPlease enter the full path to your video file (e.g., C:\\videos\\my_room.mp4 or /home/user/videos/office.mov): ").strip()
-
-    if video_file_path:
-        analysis_results = analyze_video_frames(video_file_path)
-        print_analysis_summary(analysis_results)
-    else:
-        print("No video file path provided. Exiting.")
-
+# The if __name__ == "__main__": block is removed to make it importable
